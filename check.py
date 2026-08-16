@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""JBA TICKET 公式リセールの出品を監視して、新規出品をメール通知する。
+"""JBA TICKET 公式リセールの出品を監視して、新規出品をメール通知する。（v2）
 
-- Shopify の products.json を優先して使い、ダメなら HTML から拾うフォールバック付き
-- 前回の出品一覧を state.json に保存し、差分が出たときだけ通知する
+v2 の変更点:
+- テンプレート由来の偽リンク（_handle_ など）を除外
+- 「商品が見つかりませんでした」表示を最優先で判定
+- ページ上の「N件」表示と突き合わせて、ズレたら警告を出す
+- 新規出品は商品名・価格・在庫状況まで取得してメールに載せる
 """
 
 import json
@@ -14,7 +17,6 @@ import urllib.error
 import urllib.request
 from email.message import EmailMessage
 
-# 監視したいイベント。カンマ区切りで複数指定できる
 EVENT_IDS = [
     e.strip()
     for e in os.environ.get(
@@ -31,6 +33,15 @@ UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
+# 在庫ゼロ・売り切れ時にサイトが出す文言
+EMPTY_MARKERS = [
+    "検索に一致する商品が見つかりませんでした",
+    "商品が見つかりませんでした",
+]
+
+# 商品ではないのに /products/ を含むもの（テンプレート雛形や標準商品）
+IGNORE_HANDLES = {"_handle_", "gift-card"}
+
 
 def collection_url(event_id: str) -> str:
     return f"{BASE}/collections/resale/event_id:{event_id}"
@@ -42,49 +53,52 @@ def fetch(url: str) -> str:
         return res.read().decode("utf-8", errors="replace")
 
 
-def listings_from_json(event_id: str):
-    """products.json から出品一覧を取る（成功したら list、失敗したら None）"""
-    url = f"{collection_url(event_id)}/products.json?limit=250"
+def is_real_handle(handle: str) -> bool:
+    """テンプレート由来の偽リンクを弾く"""
+    if handle in IGNORE_HANDLES:
+        return False
+    if handle.startswith("_") or handle.endswith("_"):
+        return False
+    # Liquid / JS のテンプレート記法が混ざっているもの
+    if any(t in handle for t in ("{{", "}}", "%7B", "$", "handle")):
+        return False
+    return True
+
+
+def product_detail(handle: str) -> dict:
+    """Shopify の商品JSONから名前と価格を取る。失敗しても致命的ではない。"""
+    info = {"title": handle, "price": None, "available": None}
     try:
-        data = json.loads(fetch(url))
-    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError):
-        return None
+        data = json.loads(fetch(f"{BASE}/products/{handle}.js"))
+    except Exception:
+        return info
 
-    products = data.get("products")
-    if products is None:
-        return None
-
-    items = []
-    for p in products:
-        handle = p.get("handle", "")
-        items.append(
-            {
-                "key": str(p.get("id") or handle),
-                "title": p.get("title") or handle,
-                "url": f"{BASE}/products/{handle}" if handle else collection_url(event_id),
-            }
-        )
-    return items
-
-
-def listings_from_html(event_id: str):
-    """HTML から商品リンクを拾うフォールバック"""
-    html = fetch(collection_url(event_id))
-    handles = []
-    for h in re.findall(r'/products/([A-Za-z0-9%\-_]+)', html):
-        if h not in handles:
-            handles.append(h)
-    return [
-        {"key": h, "title": h, "url": f"{BASE}/products/{h}"} for h in handles
-    ]
+    info["title"] = data.get("title") or handle
+    price = data.get("price")
+    if isinstance(price, int):
+        info["price"] = f"{price // 100:,}円"
+    info["available"] = data.get("available")
+    return info
 
 
 def get_listings(event_id: str):
-    items = listings_from_json(event_id)
-    if items is None:
-        print(f"[warn] products.json が使えないので HTML にフォールバック: {event_id}")
-        items = listings_from_html(event_id)
-    return items
+    """(出品リスト, ページ表示件数) を返す"""
+    html = fetch(collection_url(event_id))
+
+    # ページ上の「N件」表示（照合用）
+    m = re.search(r">\s*(\d+)\s*件", html)
+    shown_count = int(m.group(1)) if m else None
+
+    # 「見つかりませんでした」が出ていたら、リンクに関係なく0件
+    if any(marker in html for marker in EMPTY_MARKERS):
+        return [], 0
+
+    handles = []
+    for h in re.findall(r'href="/products/([A-Za-z0-9\-_%]+)', html):
+        if is_real_handle(h) and h not in handles:
+            handles.append(h)
+
+    return [{"key": h, "handle": h} for h in handles], shown_count
 
 
 def load_state() -> dict:
@@ -121,7 +135,7 @@ def send_mail(subject: str, body: str) -> None:
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=TIMEOUT) as smtp:
         smtp.login(user, password)
         smtp.send_message(msg)
-    print(f"[info] メール送信済み: {to}")
+    print("[info] メール送信しました")
 
 
 def main() -> int:
@@ -130,12 +144,20 @@ def main() -> int:
 
     for event_id in EVENT_IDS:
         try:
-            items = get_listings(event_id)
-        except Exception as e:  # ネットワーク断などで落ちても次回に持ち越す
+            items, shown_count = get_listings(event_id)
+        except Exception as e:
             print(f"[warn] 取得失敗 ({event_id}): {e}")
             continue
 
         current = {i["key"]: i for i in items}
+
+        # ページ表示件数と拾えた数が食い違ったら知らせる（解析ズレの早期発見用）
+        if shown_count is not None and shown_count != len(current):
+            print(
+                f"[warn] ページ表示 {shown_count} 件 に対し "
+                f"{len(current)} 件しか解析できていません。要確認"
+            )
+
         seen = set(state.get(event_id, []))
         new_keys = [k for k in current if k not in seen]
 
@@ -144,15 +166,17 @@ def main() -> int:
         if new_keys:
             lines = ["リセールの出品を検知しました。", ""]
             for k in new_keys:
-                lines.append(f"・{current[k]['title']}")
-                lines.append(f"  {current[k]['url']}")
+                d = product_detail(current[k]["handle"])
+                label = d["title"]
+                if d["price"]:
+                    label += f" / {d['price']}"
+                if d["available"] is False:
+                    label += "（既に売切）"
+                lines.append(f"・{label}")
+                lines.append(f"  {BASE}/products/{current[k]['handle']}")
             lines += ["", "一覧ページ:", collection_url(event_id)]
-            send_mail(
-                f"【JBAリセール】新規出品 {len(new_keys)}件",
-                "\n".join(lines),
-            )
+            send_mail(f"【JBAリセール】新規出品 {len(new_keys)}件", "\n".join(lines))
 
-        # 売り切れて消えた分は state からも消す（再出品されたら再通知される）
         if state.get(event_id, []) != sorted(current):
             state[event_id] = sorted(current)
             changed = True
