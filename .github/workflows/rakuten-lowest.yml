@@ -1,0 +1,46 @@
+name: Rakuten lowest price
+
+on:
+  workflow_dispatch:   # Actions 画面の「Run workflow」から実行
+    inputs:
+      keyword:
+        description: '検索キーワード'
+        required: true
+      qty:
+        description: '欲しい個数'
+        default: '1'
+      coupons:
+        description: 'クーポン（スペース区切り 例: shopA=500@3000 *=10%）'
+        default: ''
+      extra_point:
+        description: 'SPU等の上乗せポイント倍率（%）'
+        default: '0'
+      ng:
+        description: '除外キーワード（カンマ区切り）'
+        default: '中古,ジャンク'
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Search
+        env:
+          RAKUTEN_APP_ID: ${{ secrets.RAKUTEN_APP_ID }}
+          RAKUTEN_ACCESS_KEY: ${{ secrets.RAKUTEN_ACCESS_KEY }}
+          KEYWORD: ${{ inputs.keyword }}
+          QTY: ${{ inputs.qty }}
+          COUPONS: ${{ inputs.coupons }}
+          EXTRA_POINT: ${{ inputs.extra_point }}
+          NG: ${{ inputs.ng }}
+        run: |
+          args=(--qty "$QTY" --extra-point "$EXTRA_POINT")
+          [[ -n "$NG" ]] && args+=(--ng "$NG")
+          for c in $COUPONS; do args+=(--coupon "$c"); done
+          python rakuten_lowest.py "$KEYWORD" "${args[@]}"
