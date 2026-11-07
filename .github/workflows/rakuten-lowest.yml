@@ -34,6 +34,8 @@ jobs:
         env:
           RAKUTEN_APP_ID: ${{ secrets.RAKUTEN_APP_ID }}
           RAKUTEN_ACCESS_KEY: ${{ secrets.RAKUTEN_ACCESS_KEY }}
+          # 楽天アプリ設定の「WebサイトURL」と同じ値にする（Variables で上書き可）
+          RAKUTEN_REFERER: ${{ vars.RAKUTEN_REFERER || format('https://github.com/{0}', github.repository) }}
           KEYWORD: ${{ inputs.keyword }}
           QTY: ${{ inputs.qty }}
           COUPONS: ${{ inputs.coupons }}

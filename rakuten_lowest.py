@@ -40,6 +40,7 @@ import math
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -264,6 +265,11 @@ def to_item(raw: dict) -> Item:
     )
 
 
+def _origin(url: str) -> str:
+    u = urllib.parse.urlsplit(url)
+    return f"{u.scheme}://{u.netloc}"
+
+
 def search(
     keyword: str,
     app_id: str,
@@ -273,6 +279,7 @@ def search(
     max_price: int | None = None,
     ng_keyword: str | None = None,
     endpoint: str | None = None,
+    referer: str | None = None,
 ) -> list[Item]:
     """楽天市場商品検索 API を呼び、在庫ありの商品を返す。"""
     if endpoint is None:
@@ -301,9 +308,22 @@ def search(
             params["NGKeyword"] = ng_keyword
 
         url = f"{endpoint}?{urllib.parse.urlencode(params)}"
-        req = urllib.request.Request(url, headers={"User-Agent": "rakuten-lowest/1.0"})
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as res:
-            data = json.loads(res.read().decode("utf-8"))
+        headers = {"User-Agent": "rakuten-lowest/1.0"}
+        if referer:
+            # 新APIは、アプリ設定の「WebサイトURL」と一致する Referer が必須
+            headers["Referer"] = referer
+            headers["Origin"] = _origin(referer)
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as res:
+                data = json.loads(res.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(
+                f"楽天APIエラー HTTP {e.code}: {detail}\n"
+                "  → 403 の場合: RAKUTEN_REFERER が楽天アプリ設定の『WebサイトURL』と"
+                "一致しているか、アプリID・アクセスキーが正しいか確認してください"
+            ) from None
 
         raws = data.get("Items") or data.get("items") or []
         for raw in raws:
@@ -380,16 +400,21 @@ def main(argv: list[str] | None = None) -> int:
     coupons = dict(parse_coupon(c) for c in args.coupon)
     ng = " ".join(s for s in (args.ng or "").split(",") if s.strip()) or None
 
-    items = search(
-        args.keyword,
-        app_id,
-        access_key=os.environ.get("RAKUTEN_ACCESS_KEY") or None,
-        pages=args.pages,
-        min_price=args.min_price,
-        max_price=args.max_price,
-        ng_keyword=ng,
-        endpoint=os.environ.get("RAKUTEN_API_ENDPOINT") or None,
-    )
+    try:
+        items = search(
+            args.keyword,
+            app_id,
+            access_key=os.environ.get("RAKUTEN_ACCESS_KEY") or None,
+            pages=args.pages,
+            min_price=args.min_price,
+            max_price=args.max_price,
+            ng_keyword=ng,
+            endpoint=os.environ.get("RAKUTEN_API_ENDPOINT") or None,
+            referer=os.environ.get("RAKUTEN_REFERER") or None,
+        )
+    except RuntimeError as e:
+        print(f"[error] {e}", file=sys.stderr)
+        return 1
     if not items:
         print("該当商品が見つかりませんでした")
         return 1
