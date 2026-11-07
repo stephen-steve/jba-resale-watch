@@ -13,6 +13,10 @@
 1. [楽天ウェブサービス](https://webservice.rakuten.co.jp/) でアプリIDを発行
 2. リポジトリの Settings → Secrets → Actions に `RAKUTEN_APP_ID`
    （新APIでアクセスキーがある場合は `RAKUTEN_ACCESS_KEY` も）を登録
+3. 新APIは Referer（呼び出し元URL）のチェックがあるため、楽天アプリ設定の
+   「WebサイトURL」に `https://github.com/stephen-steve/jba-resale-watch` を登録する。
+   別のURLを登録している場合は Settings → Secrets and variables → Actions →
+   **Variables** に `RAKUTEN_REFERER` としてそのURLを登録する
 
 ### 実行
 - GitHub: Actions → **Rakuten lowest price** → Run workflow（結果はジョブの Summary に表で出ます）
